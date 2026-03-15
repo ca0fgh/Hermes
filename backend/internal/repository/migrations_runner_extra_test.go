@@ -219,7 +219,7 @@ func TestEnsureAtlasBaselineAligned(t *testing.T) {
 	})
 }
 
-func TestApplyMigrationsFS_ChecksumMismatchRejected(t *testing.T) {
+func TestApplyMigrationsFS_ChecksumMismatchAutoFixesForLocalDev(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
@@ -228,6 +228,9 @@ func TestApplyMigrationsFS_ChecksumMismatchRejected(t *testing.T) {
 	mock.ExpectQuery("SELECT checksum FROM schema_migrations WHERE filename = \\$1").
 		WithArgs("001_init.sql").
 		WillReturnRows(sqlmock.NewRows([]string{"checksum"}).AddRow("mismatched-checksum"))
+	mock.ExpectExec("UPDATE schema_migrations SET checksum = \\$1 WHERE filename = \\$2").
+		WithArgs(sqlmock.AnyArg(), "001_init.sql").
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("SELECT pg_advisory_unlock\\(\\$1\\)").
 		WithArgs(migrationsAdvisoryLockID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -236,8 +239,7 @@ func TestApplyMigrationsFS_ChecksumMismatchRejected(t *testing.T) {
 		"001_init.sql": &fstest.MapFile{Data: []byte("CREATE TABLE t(id int);")},
 	}
 	err = applyMigrationsFS(context.Background(), db, fsys)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "checksum mismatch")
+	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
