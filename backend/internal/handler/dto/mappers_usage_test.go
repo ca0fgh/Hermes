@@ -2,6 +2,7 @@ package dto
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ca0fgh/kyllenios-core/internal/service"
 	"github.com/stretchr/testify/require"
@@ -104,6 +105,35 @@ func TestUsageLogFromService_IncludesServiceTierForUserAndAdmin(t *testing.T) {
 	require.Equal(t, upstreamEndpoint, *adminDTO.UpstreamEndpoint)
 	require.NotNil(t, adminDTO.AccountRateMultiplier)
 	require.InDelta(t, 1.5, *adminDTO.AccountRateMultiplier, 1e-12)
+}
+
+func TestAccountFromServiceShallow_UsesEffectiveFixedDailyQuotaWindow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	resetHour := float64((now.Hour() + 23) % 24)
+	account := &service.Account{
+		Type: service.AccountTypeAPIKey,
+		Extra: map[string]any{
+			"quota_daily_limit":      120.0,
+			"quota_daily_used":       3.97,
+			"quota_daily_start":      now.Add(-2 * time.Hour).Format(time.RFC3339),
+			"quota_daily_reset_mode": "fixed",
+			"quota_daily_reset_hour": resetHour,
+			"quota_reset_timezone":   "UTC",
+			"quota_daily_reset_at":   now.Add(-1 * time.Minute).Format(time.RFC3339),
+		},
+	}
+
+	dtoAccount := AccountFromServiceShallow(account)
+	require.NotNil(t, dtoAccount)
+	require.NotNil(t, dtoAccount.QuotaDailyUsed)
+	require.InDelta(t, 0.0, *dtoAccount.QuotaDailyUsed, 1e-12)
+	require.NotNil(t, dtoAccount.QuotaDailyResetAt)
+
+	resetAt, err := time.Parse(time.RFC3339, *dtoAccount.QuotaDailyResetAt)
+	require.NoError(t, err)
+	require.True(t, resetAt.After(now), "quota_daily_reset_at should point to the next future reset boundary")
 }
 
 func f64Ptr(value float64) *float64 {

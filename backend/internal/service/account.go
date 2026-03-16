@@ -1241,6 +1241,25 @@ func (a *Account) GetQuotaDailyUsed() float64 {
 	return a.getExtraFloat64("quota_daily_used")
 }
 
+func (a *Account) GetEffectiveQuotaDailyUsed() float64 {
+	used := a.GetQuotaDailyUsed()
+	if used <= 0 {
+		return 0
+	}
+
+	start := a.getExtraTime("quota_daily_start")
+	var expired bool
+	if a.GetQuotaDailyResetMode() == "fixed" {
+		expired = a.isFixedDailyPeriodExpired(start)
+	} else {
+		expired = isPeriodExpired(start, 24*time.Hour)
+	}
+	if expired {
+		return 0
+	}
+	return used
+}
+
 // GetQuotaWeeklyLimit 获取周额度限制（美元），0 表示未启用
 func (a *Account) GetQuotaWeeklyLimit() float64 {
 	return a.getExtraFloat64("quota_weekly_limit")
@@ -1249,6 +1268,25 @@ func (a *Account) GetQuotaWeeklyLimit() float64 {
 // GetQuotaWeeklyUsed 获取本周已用额度（美元）
 func (a *Account) GetQuotaWeeklyUsed() float64 {
 	return a.getExtraFloat64("quota_weekly_used")
+}
+
+func (a *Account) GetEffectiveQuotaWeeklyUsed() float64 {
+	used := a.GetQuotaWeeklyUsed()
+	if used <= 0 {
+		return 0
+	}
+
+	start := a.getExtraTime("quota_weekly_start")
+	var expired bool
+	if a.GetQuotaWeeklyResetMode() == "fixed" {
+		expired = a.isFixedWeeklyPeriodExpired(start)
+	} else {
+		expired = isPeriodExpired(start, 7*24*time.Hour)
+	}
+	if expired {
+		return 0
+	}
+	return used
 }
 
 // getExtraFloat64 从 Extra 中读取指定 key 的 float64 值
@@ -1347,6 +1385,38 @@ func (a *Account) GetQuotaResetTimezone() string {
 		return tz
 	}
 	return "UTC"
+}
+
+func (a *Account) GetEffectiveQuotaDailyResetAt() string {
+	if a.GetQuotaDailyResetMode() != "fixed" {
+		return a.getExtraString("quota_daily_reset_at")
+	}
+	resetAt := a.getExtraTime("quota_daily_reset_at")
+	now := time.Now()
+	if !resetAt.IsZero() && resetAt.After(now) {
+		return resetAt.UTC().Format(time.RFC3339)
+	}
+	tz, err := time.LoadLocation(a.GetQuotaResetTimezone())
+	if err != nil {
+		tz = time.UTC
+	}
+	return nextFixedDailyReset(a.GetQuotaDailyResetHour(), tz, now).UTC().Format(time.RFC3339)
+}
+
+func (a *Account) GetEffectiveQuotaWeeklyResetAt() string {
+	if a.GetQuotaWeeklyResetMode() != "fixed" {
+		return a.getExtraString("quota_weekly_reset_at")
+	}
+	resetAt := a.getExtraTime("quota_weekly_reset_at")
+	now := time.Now()
+	if !resetAt.IsZero() && resetAt.After(now) {
+		return resetAt.UTC().Format(time.RFC3339)
+	}
+	tz, err := time.LoadLocation(a.GetQuotaResetTimezone())
+	if err != nil {
+		tz = time.UTC
+	}
+	return nextFixedWeeklyReset(a.GetQuotaWeeklyResetDay(), a.GetQuotaWeeklyResetHour(), tz, now).UTC().Format(time.RFC3339)
 }
 
 // nextFixedDailyReset 计算在 after 之后的下一个每日固定重置时间点

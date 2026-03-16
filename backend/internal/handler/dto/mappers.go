@@ -273,12 +273,12 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		}
 		if limit := a.GetQuotaDailyLimit(); limit > 0 {
 			out.QuotaDailyLimit = &limit
-			used := a.GetQuotaDailyUsed()
+			used := a.GetEffectiveQuotaDailyUsed()
 			out.QuotaDailyUsed = &used
 		}
 		if limit := a.GetQuotaWeeklyLimit(); limit > 0 {
 			out.QuotaWeeklyLimit = &limit
-			used := a.GetQuotaWeeklyUsed()
+			used := a.GetEffectiveQuotaWeeklyUsed()
 			out.QuotaWeeklyUsed = &used
 		}
 		// 固定时间重置配置
@@ -298,13 +298,11 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 			tz := a.GetQuotaResetTimezone()
 			out.QuotaResetTimezone = &tz
 		}
-		if a.Extra != nil {
-			if v, ok := a.Extra["quota_daily_reset_at"].(string); ok && v != "" {
-				out.QuotaDailyResetAt = &v
-			}
-			if v, ok := a.Extra["quota_weekly_reset_at"].(string); ok && v != "" {
-				out.QuotaWeeklyResetAt = &v
-			}
+		if v := a.GetEffectiveQuotaDailyResetAt(); v != "" {
+			out.QuotaDailyResetAt = &v
+		}
+		if v := a.GetEffectiveQuotaWeeklyResetAt(); v != "" {
+			out.QuotaWeeklyResetAt = &v
 		}
 	}
 
