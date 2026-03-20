@@ -49,6 +49,7 @@ REDIS_EXTRA_PATHS = [
     "/usr/local/bin/redis-server",
     "/usr/local/bin/redis-cli",
 ]
+POSTGRES_APP_VERSIONS = ["18", "17", "16", "15"]
 
 
 def print_step(message: str) -> None:
@@ -160,9 +161,9 @@ def local_runtime_dependency_installed(display_name: str) -> bool:
     candidates: list[tuple[str, list[str]]] = []
     if display_name == "PostgreSQL":
         candidates = [
-            ("postgres", POSTGRES_EXTRA_PATHS),
-            ("pg_ctl", POSTGRES_EXTRA_PATHS),
-            ("psql", []),
+            ("postgres", postgres_extra_paths("postgres")),
+            ("pg_ctl", postgres_extra_paths("pg_ctl")),
+            ("psql", postgres_extra_paths("psql")),
         ]
     elif display_name == "Redis":
         candidates = [
@@ -213,6 +214,73 @@ def read_section_host_port(config_path: Path, section_name: str, default_host: s
         except ValueError as exc:
             raise ValueError(f"invalid port in {config_path} -> {section_name}.port: {values['port']}") from exc
     return host, port
+
+
+def read_database_settings(config_path: Path) -> dict[str, str]:
+    values = read_config_sections(config_path).get("database", {})
+    return {
+        "host": values.get("host", "127.0.0.1") or "127.0.0.1",
+        "port": values.get("port", "5432") or "5432",
+        "user": values.get("user", "postgres") or "postgres",
+        "password": values.get("password", "postgres"),
+        "dbname": values.get("dbname", "hermes-proxy") or "hermes-proxy",
+    }
+
+
+def read_redis_settings(config_path: Path) -> dict[str, str]:
+    values = read_config_sections(config_path).get("redis", {})
+    return {
+        "host": values.get("host", "127.0.0.1") or "127.0.0.1",
+        "port": values.get("port", "6379") or "6379",
+        "password": values.get("password", ""),
+    }
+
+
+def postgres_extra_paths(binary_name: str) -> list[str]:
+    paths = [
+        f"/opt/homebrew/bin/{binary_name}",
+        f"/usr/local/bin/{binary_name}",
+        f"/opt/homebrew/opt/postgresql@17/bin/{binary_name}",
+        f"/opt/homebrew/opt/postgresql@16/bin/{binary_name}",
+        f"/opt/homebrew/opt/postgresql@15/bin/{binary_name}",
+        f"/usr/local/opt/postgresql@17/bin/{binary_name}",
+        f"/usr/local/opt/postgresql@16/bin/{binary_name}",
+        f"/usr/local/opt/postgresql@15/bin/{binary_name}",
+    ]
+    paths.extend(
+        f"/Applications/Postgres.app/Contents/Versions/{version}/bin/{binary_name}"
+        for version in POSTGRES_APP_VERSIONS
+    )
+    return paths
+
+
+def resolve_pg_ctl_bin() -> str:
+    return resolve_tool("pg_ctl", "PG_CTL_BIN", "", postgres_extra_paths("pg_ctl"))
+
+
+def resolve_initdb_bin() -> str:
+    return resolve_tool("initdb", "INITDB_BIN", "", postgres_extra_paths("initdb"))
+
+
+def resolve_psql_bin() -> str:
+    return resolve_tool("psql", "PSQL_BIN", "", postgres_extra_paths("psql"))
+
+
+def resolve_redis_server_bin() -> str:
+    return resolve_tool("redis-server", "REDIS_SERVER_BIN", "", REDIS_EXTRA_PATHS)
+
+
+def is_local_host(host: str) -> bool:
+    normalized = (host or "").strip().lower()
+    return normalized in {"", "127.0.0.1", "localhost", "0.0.0.0", "::1", "::"}
+
+
+def is_tcp_port_open(host: str, port: int, timeout_seconds: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((probe_host(host), port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
 
 
 def collect_build_tool_issues(args: argparse.Namespace) -> list[str]:
@@ -343,6 +411,21 @@ def read_server_config(config_path: Path) -> tuple[str, int]:
         fail(str(exc))
 
 
+def start_detached_process(command: list[str], cwd: Path, log_path: Path) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print_step(f"run detached: {' '.join(command)} (cwd={cwd})")
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return process.pid
+
+
 def listening_pids(port: int) -> list[int]:
     lsof = shutil.which("lsof")
     if not lsof:
@@ -415,6 +498,226 @@ def wait_until_listening(host: str, port: int, timeout_seconds: float = 15) -> N
     fail(f"new process did not start listening on {target}:{port} within {timeout_seconds} seconds")
 
 
+def wait_until_postgres_ready(psql_bin: str, host: str, port: int, timeout_seconds: float = 20) -> None:
+    target = probe_host(host)
+    deadline = time.time() + timeout_seconds
+    command = [
+        psql_bin,
+        "-h",
+        target,
+        "-p",
+        str(port),
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-Atqc",
+        "select 1",
+    ]
+    while time.time() < deadline:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip() == "1":
+            return
+        time.sleep(0.3)
+    fail(f"postgres did not become ready on {target}:{port} within {timeout_seconds} seconds")
+
+
+def sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def run_psql_command(psql_bin: str, host: str, port: int, sql: str, *, capture_output: bool = False) -> str:
+    command = [
+        psql_bin,
+        "-h",
+        probe_host(host),
+        "-p",
+        str(port),
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-Atqc",
+        sql,
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        fail(result.stderr.strip() or f"`psql` failed while executing SQL: {sql}")
+    if capture_output:
+        return result.stdout.strip()
+    return ""
+
+
+def bootstrap_local_postgres_database(
+    psql_bin: str,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    dbname: str,
+) -> None:
+    role_name = sql_identifier(user)
+    role_literal = sql_literal(user)
+
+    run_psql_command(
+        psql_bin,
+        host,
+        port,
+        "\n".join(
+            [
+                "DO $$",
+                "BEGIN",
+                f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {role_literal}) THEN",
+                f"        CREATE ROLE {role_name} LOGIN;",
+                "    END IF;",
+                "END",
+                "$$;",
+            ]
+        ),
+    )
+
+    if password:
+        run_psql_command(
+            psql_bin,
+            host,
+            port,
+            f"ALTER ROLE {role_name} WITH LOGIN PASSWORD {sql_literal(password)};",
+        )
+    else:
+        run_psql_command(psql_bin, host, port, f"ALTER ROLE {role_name} WITH LOGIN;")
+
+    if dbname == "postgres":
+        return
+
+    database_literal = sql_literal(dbname)
+    database_name = sql_identifier(dbname)
+    exists = run_psql_command(
+        psql_bin,
+        host,
+        port,
+        f"SELECT 1 FROM pg_database WHERE datname = {database_literal};",
+        capture_output=True,
+    )
+    if exists != "1":
+        run_psql_command(psql_bin, host, port, f"CREATE DATABASE {database_name} OWNER {role_name};")
+
+
+def ensure_local_redis_running(app_dir: Path, config_path: Path) -> None:
+    settings = read_redis_settings(config_path)
+    host = settings["host"]
+    try:
+        port = int(settings["port"])
+    except ValueError as exc:
+        fail(f"invalid port in {config_path} -> redis.port: {settings['port']}")
+        raise exc
+
+    if not is_local_host(host):
+        print_step(f"skip redis autostart for non-local host: {host}:{port}")
+        return
+    if is_tcp_port_open(host, port):
+        print_step(f"redis already listening on {probe_host(host)}:{port}")
+        return
+
+    data_dir = (app_dir / "redis").resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        resolve_redis_server_bin(),
+        "--dir",
+        str(data_dir),
+        "--dbfilename",
+        "dump.rdb",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--save",
+        "60",
+        "1",
+        "--port",
+        str(port),
+    ]
+    if settings["password"]:
+        command.extend(["--requirepass", settings["password"]])
+
+    log_path = app_dir / "data" / "redis.stdout.log"
+    start_detached_process(command, app_dir, log_path)
+    wait_until_listening(host, port)
+
+
+def ensure_local_postgres_running(app_dir: Path, config_path: Path) -> None:
+    settings = read_database_settings(config_path)
+    host = settings["host"]
+    try:
+        port = int(settings["port"])
+    except ValueError as exc:
+        fail(f"invalid port in {config_path} -> database.port: {settings['port']}")
+        raise exc
+
+    if not is_local_host(host):
+        print_step(f"skip postgres autostart for non-local host: {host}:{port}")
+        return
+    if is_tcp_port_open(host, port):
+        print_step(f"postgres already listening on {probe_host(host)}:{port}")
+        return
+
+    pg_ctl_bin = resolve_pg_ctl_bin()
+    initdb_bin = resolve_initdb_bin()
+    psql_bin = resolve_psql_bin()
+    data_dir = (app_dir / "postgres").resolve()
+    log_path = (app_dir / "data" / "postgres.log").resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not (data_dir / "PG_VERSION").exists():
+        data_dir.mkdir(parents=True, exist_ok=True)
+        print_step(f"initializing postgres cluster in {data_dir}")
+        subprocess.run(
+            [
+                initdb_bin,
+                "-D",
+                str(data_dir),
+                "-U",
+                "postgres",
+                "--auth=trust",
+            ],
+            check=True,
+        )
+
+    print_step(f"starting postgres cluster from {data_dir} on port {port}")
+    subprocess.run(
+        [
+            pg_ctl_bin,
+            "-D",
+            str(data_dir),
+            "-l",
+            str(log_path),
+            "-o",
+            f"-p {port} -c listen_addresses=localhost",
+            "start",
+        ],
+        check=True,
+    )
+    wait_until_postgres_ready(psql_bin, host, port)
+    bootstrap_local_postgres_database(
+        psql_bin,
+        host,
+        port,
+        settings["user"],
+        settings["password"],
+        settings["dbname"],
+    )
+
+
+def ensure_runtime_services(app_dir: Path, config_path: Path) -> None:
+    ensure_local_postgres_running(app_dir, config_path)
+    ensure_local_redis_running(app_dir, config_path)
+
+
 def start_process(app_dir: Path, binary_path: Path, log_path: Path) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -469,6 +772,7 @@ def main() -> None:
 
     bootstrap_runtime_files(app_dir)
     ensure_preflight_ready(args, binary_path, config_path)
+    ensure_runtime_services(app_dir, config_path)
 
     print_step(f"using app dir: {app_dir}")
 
