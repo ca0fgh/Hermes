@@ -144,20 +144,40 @@ func decideAdminBootstrap(totalUsers, adminUsers int64) adminBootstrapDecision {
 	}
 }
 
+func needsSetupDecision(configExists, lockExists, bootstrapKnown bool, decision adminBootstrapDecision) bool {
+	if !configExists && !lockExists {
+		return true
+	}
+
+	// Recovery path: if the installation markers still exist but the configured
+	// database is effectively uninitialized again, re-enter setup instead of
+	// showing a login page that can never succeed.
+	if configExists && bootstrapKnown && decision.shouldCreate && decision.reason == adminBootstrapReasonEmptyDatabase {
+		return true
+	}
+
+	return false
+}
+
 // NeedsSetup checks if the system needs initial setup
 // Uses multiple checks to prevent attackers from forcing re-setup by deleting config
 func NeedsSetup() bool {
-	// Check 1: Config file must not exist
-	if _, err := os.Stat(GetConfigFilePath()); !os.IsNotExist(err) {
-		return false // Config exists, no setup needed
+	configExists := true
+	if _, err := os.Stat(GetConfigFilePath()); os.IsNotExist(err) {
+		configExists = false
 	}
 
-	// Check 2: Installation lock file (harder to bypass)
-	if _, err := os.Stat(GetInstallLockPath()); !os.IsNotExist(err) {
-		return false // Lock file exists, already installed
+	lockExists := true
+	if _, err := os.Stat(GetInstallLockPath()); os.IsNotExist(err) {
+		lockExists = false
 	}
 
-	return true
+	if !configExists {
+		return needsSetupDecision(false, lockExists, false, adminBootstrapDecision{})
+	}
+
+	decision, ok := configuredBootstrapDecision(GetConfigFilePath())
+	return needsSetupDecision(true, lockExists, ok, decision)
 }
 
 // TestDatabaseConnection tests the database connection and creates database if not exists
@@ -328,11 +348,7 @@ func createInstallLock() error {
 }
 
 func initializeDatabase(cfg *SetupConfig) error {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
-		cfg.Database.Password, cfg.Database.DBName, cfg.Database.SSLMode,
-	)
+	dsn := setupDatabaseDSN(cfg)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -351,11 +367,7 @@ func initializeDatabase(cfg *SetupConfig) error {
 }
 
 func createAdminUser(cfg *SetupConfig) (bool, string, error) {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
-		cfg.Database.Password, cfg.Database.DBName, cfg.Database.SSLMode,
-	)
+	dsn := setupDatabaseDSN(cfg)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -372,15 +384,10 @@ func createAdminUser(cfg *SetupConfig) (bool, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var totalUsers int64
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(1) FROM users").Scan(&totalUsers); err != nil {
+	decision, err := adminBootstrapDecisionFromDB(ctx, db)
+	if err != nil {
 		return false, "", err
 	}
-	var adminUsers int64
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(1) FROM users WHERE role = $1", service.RoleAdmin).Scan(&adminUsers); err != nil {
-		return false, "", err
-	}
-	decision := decideAdminBootstrap(totalUsers, adminUsers)
 	if !decision.shouldCreate {
 		return false, decision.reason, nil
 	}
@@ -426,6 +433,84 @@ func createAdminUser(cfg *SetupConfig) (bool, string, error) {
 		return false, "", err
 	}
 	return true, decision.reason, nil
+}
+
+func setupDatabaseDSN(cfg *SetupConfig) string {
+	sslMode := cfg.Database.SSLMode
+	if strings.TrimSpace(sslMode) == "" {
+		sslMode = "disable"
+	}
+
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
+		cfg.Database.Password, cfg.Database.DBName, sslMode,
+	)
+}
+
+func adminBootstrapDecisionFromDB(ctx context.Context, db *sql.DB) (adminBootstrapDecision, error) {
+	var totalUsers int64
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(1) FROM users").Scan(&totalUsers); err != nil {
+		return adminBootstrapDecision{}, err
+	}
+
+	var adminUsers int64
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(1) FROM users WHERE role = $1", service.RoleAdmin).Scan(&adminUsers); err != nil {
+		return adminBootstrapDecision{}, err
+	}
+
+	return decideAdminBootstrap(totalUsers, adminUsers), nil
+}
+
+func configuredBootstrapDecision(configPath string) (adminBootstrapDecision, bool) {
+	cfg, err := readSetupConfig(configPath)
+	if err != nil {
+		logger.LegacyPrintf("setup", "skip recovery setup detection: %v", err)
+		return adminBootstrapDecision{}, false
+	}
+
+	db, err := sql.Open("postgres", setupDatabaseDSN(cfg))
+	if err != nil {
+		logger.LegacyPrintf("setup", "skip recovery setup detection: open database: %v", err)
+		return adminBootstrapDecision{}, false
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			logger.LegacyPrintf("setup", "failed to close postgres connection: %v", closeErr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	decision, err := adminBootstrapDecisionFromDB(ctx, db)
+	if err != nil {
+		logger.LegacyPrintf("setup", "skip recovery setup detection: inspect bootstrap state: %v", err)
+		return adminBootstrapDecision{}, false
+	}
+
+	return decision, true
+}
+
+func readSetupConfig(configPath string) (*SetupConfig, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg SetupConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse setup config: %w", err)
+	}
+
+	if strings.TrimSpace(cfg.Database.Host) == "" ||
+		cfg.Database.Port == 0 ||
+		strings.TrimSpace(cfg.Database.User) == "" ||
+		strings.TrimSpace(cfg.Database.DBName) == "" {
+		return nil, fmt.Errorf("config missing database connection fields")
+	}
+
+	return &cfg, nil
 }
 
 func writeConfigFile(cfg *SetupConfig) error {

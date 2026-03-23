@@ -175,6 +175,36 @@ class EnsurePreflightReadyTest(unittest.TestCase):
 
 
 class EnsureRuntimeServicesTest(unittest.TestCase):
+    def test_build_local_database_guard_issue_reports_more_complete_alternative_port(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_dir = Path(tmpdir)
+            config_path = app_dir / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "database:",
+                        "    host: 127.0.0.1",
+                        "    port: 5433",
+                        "    user: hermes-proxy",
+                        "    password: secret",
+                        "    dbname: hermes-proxy",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(restart, "resolve_psql_bin", return_value="/mock/psql"):
+                with mock.patch.object(restart, "read_local_database_counts") as read_counts:
+                    read_counts.side_effect = [
+                        {"users": 1, "accounts": 0, "api_keys": 0},
+                        {"users": 1, "accounts": 369, "api_keys": 1},
+                    ]
+                    issue = restart.build_local_database_guard_issue(config_path)
+
+        self.assertIn("5433", issue)
+        self.assertIn("5432", issue)
+        self.assertIn("accounts=369", issue)
+
     def test_ensure_runtime_services_starts_local_postgres_and_redis(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             app_dir = Path(tmpdir)
@@ -198,9 +228,41 @@ class EnsureRuntimeServicesTest(unittest.TestCase):
 
             with mock.patch.object(restart, "ensure_local_postgres_running") as ensure_postgres:
                 with mock.patch.object(restart, "ensure_local_redis_running") as ensure_redis:
-                    restart.ensure_runtime_services(app_dir, config_path)
+                    with mock.patch.object(restart, "build_local_database_guard_issue", return_value=None):
+                        restart.ensure_runtime_services(app_dir, config_path)
 
         ensure_postgres.assert_called_once_with(app_dir, config_path)
+        ensure_redis.assert_called_once_with(app_dir, config_path)
+
+    def test_ensure_runtime_services_skips_managed_postgres_when_disabled_in_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_dir = Path(tmpdir)
+            config_path = app_dir / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "database:",
+                        "    host: 127.0.0.1",
+                        "    port: 5432",
+                        "    user: hermes-proxy",
+                        "    password: hermes-proxy",
+                        "    dbname: hermes-proxy",
+                        "    managed_by_runtime: false",
+                        "redis:",
+                        "    host: 127.0.0.1",
+                        "    port: 6379",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(restart, "is_tcp_port_open", return_value=True):
+                with mock.patch.object(restart, "ensure_local_postgres_running") as ensure_postgres:
+                    with mock.patch.object(restart, "ensure_local_redis_running") as ensure_redis:
+                        with mock.patch.object(restart, "build_local_database_guard_issue", return_value=None):
+                            restart.ensure_runtime_services(app_dir, config_path)
+
+        ensure_postgres.assert_not_called()
         ensure_redis.assert_called_once_with(app_dir, config_path)
 
     def test_ensure_local_redis_running_starts_repo_scoped_server(self):
@@ -268,7 +330,7 @@ class EnsureRuntimeServicesTest(unittest.TestCase):
         self.assertIn(str((app_dir / "postgres").resolve()), first_command)
         self.assertEqual("/mock/pg_ctl", second_command[0])
         self.assertIn("start", second_command)
-        wait_ready.assert_called_once_with("/mock/psql", "127.0.0.1", 5432)
+        wait_ready.assert_called_once_with("/mock/psql", "127.0.0.1", 5432, "hermes-proxy", "secret", "hermes-proxy")
         bootstrap_db.assert_called_once_with(
             "/mock/psql",
             "127.0.0.1",

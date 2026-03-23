@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -50,6 +51,7 @@ REDIS_EXTRA_PATHS = [
     "/usr/local/bin/redis-cli",
 ]
 POSTGRES_APP_VERSIONS = ["18", "17", "16", "15"]
+LOCAL_POSTGRES_GUARD_PORTS = (5432, 5433)
 
 
 def print_step(message: str) -> None:
@@ -224,6 +226,7 @@ def read_database_settings(config_path: Path) -> dict[str, str]:
         "user": values.get("user", "postgres") or "postgres",
         "password": values.get("password", "postgres"),
         "dbname": values.get("dbname", "hermes-proxy") or "hermes-proxy",
+        "managed_by_runtime": values.get("managed_by_runtime", "true").lower(),
     }
 
 
@@ -498,9 +501,22 @@ def wait_until_listening(host: str, port: int, timeout_seconds: float = 15) -> N
     fail(f"new process did not start listening on {target}:{port} within {timeout_seconds} seconds")
 
 
-def wait_until_postgres_ready(psql_bin: str, host: str, port: int, timeout_seconds: float = 20) -> None:
+def wait_until_postgres_ready(
+    psql_bin: str,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    dbname: str,
+    timeout_seconds: float = 20,
+) -> None:
     target = probe_host(host)
     deadline = time.time() + timeout_seconds
+    env = os.environ.copy()
+    if password:
+        env["PGPASSWORD"] = password
+    else:
+        env.pop("PGPASSWORD", None)
     command = [
         psql_bin,
         "-h",
@@ -508,14 +524,14 @@ def wait_until_postgres_ready(psql_bin: str, host: str, port: int, timeout_secon
         "-p",
         str(port),
         "-U",
-        "postgres",
+        user,
         "-d",
-        "postgres",
+        dbname,
         "-Atqc",
         "select 1",
     ]
     while time.time() < deadline:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        result = subprocess.run(command, check=False, capture_output=True, text=True, env=env)
         if result.returncode == 0 and result.stdout.strip() == "1":
             return
         time.sleep(0.3)
@@ -606,6 +622,131 @@ def bootstrap_local_postgres_database(
     )
     if exists != "1":
         run_psql_command(psql_bin, host, port, f"CREATE DATABASE {database_name} OWNER {role_name};")
+
+
+def read_local_database_counts(
+    psql_bin: str,
+    host: str,
+    port: int,
+    user: str,
+    dbname: str,
+    password: str,
+) -> Optional[dict[str, int]]:
+    env = os.environ.copy()
+    if password:
+        env["PGPASSWORD"] = password
+    else:
+        env.pop("PGPASSWORD", None)
+
+    sql = """
+    SELECT
+      CASE WHEN to_regclass('public.users') IS NULL THEN 0 ELSE (SELECT COUNT(*) FROM users) END,
+      CASE WHEN to_regclass('public.accounts') IS NULL THEN 0 ELSE (SELECT COUNT(*) FROM accounts) END,
+      CASE WHEN to_regclass('public.api_keys') IS NULL THEN 0 ELSE (SELECT COUNT(*) FROM api_keys) END;
+    """
+    command = [
+        psql_bin,
+        "-h",
+        probe_host(host),
+        "-p",
+        str(port),
+        "-U",
+        user,
+        "-d",
+        dbname,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-AtF",
+        ",",
+        "-c",
+        sql,
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        return None
+
+    parts = result.stdout.strip().split(",")
+    if len(parts) != 3:
+        return None
+
+    try:
+        users, accounts, api_keys = [int(value) for value in parts]
+    except ValueError:
+        return None
+
+    return {"users": users, "accounts": accounts, "api_keys": api_keys}
+
+
+def local_database_selection_looks_wrong(current: dict[str, int], alternative: dict[str, int]) -> bool:
+    current_operational = current["accounts"] + current["api_keys"]
+    alternative_operational = alternative["accounts"] + alternative["api_keys"]
+
+    if alternative_operational <= 0:
+        return False
+
+    if current["users"] == 0 and alternative["users"] > 0:
+        return True
+
+    if current_operational == 0 and alternative["users"] >= current["users"]:
+        return True
+
+    return False
+
+
+def build_local_database_guard_issue(config_path: Path) -> Optional[str]:
+    if os.environ.get("HERMES_SKIP_LOCAL_DB_GUARD") == "1":
+        return None
+
+    settings = read_database_settings(config_path)
+    host = settings["host"]
+    if not is_local_host(host):
+        return None
+
+    try:
+        current_port = int(settings["port"])
+    except ValueError:
+        return None
+
+    psql_bin = resolve_psql_bin()
+    current = read_local_database_counts(
+        psql_bin,
+        host,
+        current_port,
+        settings["user"],
+        settings["dbname"],
+        settings["password"],
+    )
+    if not current:
+        return None
+
+    for candidate_port in LOCAL_POSTGRES_GUARD_PORTS:
+        if candidate_port == current_port:
+            continue
+        if not is_tcp_port_open(host, candidate_port):
+            continue
+
+        alternative = read_local_database_counts(
+            psql_bin,
+            host,
+            candidate_port,
+            settings["user"],
+            settings["dbname"],
+            settings["password"],
+        )
+        if not alternative:
+            continue
+
+        if local_database_selection_looks_wrong(current, alternative):
+            target = f"{probe_host(host)}:{current_port}/{settings['dbname']}"
+            alternative_target = f"{probe_host(host)}:{candidate_port}/{settings['dbname']}"
+            return (
+                f"configured database {target} looks much emptier than local database {alternative_target} "
+                f"(current: users={current['users']}, accounts={current['accounts']}, api_keys={current['api_keys']}; "
+                f"alternative: users={alternative['users']}, accounts={alternative['accounts']}, api_keys={alternative['api_keys']}). "
+                f"Update config.yaml if you meant to use the populated database, or set HERMES_SKIP_LOCAL_DB_GUARD=1 to bypass."
+            )
+
+    return None
 
 
 def ensure_local_redis_running(app_dir: Path, config_path: Path) -> None:
@@ -702,7 +843,14 @@ def ensure_local_postgres_running(app_dir: Path, config_path: Path) -> None:
         ],
         check=True,
     )
-    wait_until_postgres_ready(psql_bin, host, port)
+    wait_until_postgres_ready(
+        psql_bin,
+        host,
+        port,
+        settings["user"],
+        settings["password"],
+        settings["dbname"],
+    )
     bootstrap_local_postgres_database(
         psql_bin,
         host,
@@ -714,8 +862,29 @@ def ensure_local_postgres_running(app_dir: Path, config_path: Path) -> None:
 
 
 def ensure_runtime_services(app_dir: Path, config_path: Path) -> None:
-    ensure_local_postgres_running(app_dir, config_path)
+    database_settings = read_database_settings(config_path)
+    postgres_managed_by_runtime = database_settings.get("managed_by_runtime", "true") != "false"
+
+    if postgres_managed_by_runtime:
+        ensure_local_postgres_running(app_dir, config_path)
+    else:
+        host = database_settings["host"]
+        try:
+            port = int(database_settings["port"])
+        except ValueError as exc:
+            fail(f"invalid port in {config_path} -> database.port: {database_settings['port']}")
+            raise exc
+        if not is_tcp_port_open(host, port):
+            fail(
+                f"configured external postgres is not listening on {probe_host(host)}:{port}; "
+                "restart.py is configured to not auto-start a runtime-managed PostgreSQL for this project"
+            )
+        print_step(f"external postgres already listening on {probe_host(host)}:{port}")
+
     ensure_local_redis_running(app_dir, config_path)
+    issue = build_local_database_guard_issue(config_path)
+    if issue:
+        fail(issue)
 
 
 def start_process(app_dir: Path, binary_path: Path, log_path: Path) -> int:

@@ -54,6 +54,72 @@ func TestDecideAdminBootstrap(t *testing.T) {
 	}
 }
 
+func TestNeedsSetupDecision(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		configExists   bool
+		lockExists     bool
+		bootstrapKnown bool
+		decision       adminBootstrapDecision
+		want           bool
+	}{
+		{
+			name:         "fresh install with no config or lock needs setup",
+			configExists: false,
+			lockExists:   false,
+			want:         true,
+		},
+		{
+			name:           "configured install with admin stays in normal mode",
+			configExists:   true,
+			lockExists:     true,
+			bootstrapKnown: true,
+			decision: adminBootstrapDecision{
+				shouldCreate: false,
+				reason:       adminBootstrapReasonAdminExists,
+			},
+			want: false,
+		},
+		{
+			name:           "configured install with empty database re-enters setup",
+			configExists:   true,
+			lockExists:     true,
+			bootstrapKnown: true,
+			decision: adminBootstrapDecision{
+				shouldCreate: true,
+				reason:       adminBootstrapReasonEmptyDatabase,
+			},
+			want: true,
+		},
+		{
+			name:         "lock file without config remains installed",
+			configExists: false,
+			lockExists:   true,
+			want:         false,
+		},
+		{
+			name:         "configured install with unknown db state remains installed",
+			configExists: true,
+			lockExists:   true,
+			want:         false,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := needsSetupDecision(tc.configExists, tc.lockExists, tc.bootstrapKnown, tc.decision)
+			if got != tc.want {
+				t.Fatalf("needsSetupDecision()=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSetupDefaultAdminConcurrency(t *testing.T) {
 	t.Run("simple mode admin uses higher concurrency", func(t *testing.T) {
 		t.Setenv("RUN_MODE", "simple")
