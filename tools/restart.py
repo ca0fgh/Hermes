@@ -17,6 +17,8 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
 FRONTEND_DIR = REPO_ROOT / "frontend"
 BACKEND_DIR = REPO_ROOT / "backend"
+EMBED_FRONTEND_DIST_DIR = BACKEND_DIR / "internal" / "web" / "dist"
+EMBED_FRONTEND_INDEX_HTML = EMBED_FRONTEND_DIST_DIR / "index.html"
 DEFAULT_APP_DIR = REPO_ROOT / ".hermes-proxy-runtime"
 NODE_EXTRA_PATHS = ["/Users/money/.local/node/bin/node", "/opt/homebrew/bin/node", "/usr/local/bin/node"]
 PNPM_EXTRA_PATHS = ["/Users/money/.local/node/bin/pnpm", "/opt/homebrew/bin/pnpm", "/usr/local/bin/pnpm"]
@@ -402,9 +404,21 @@ def ensure_preflight_ready(
     fail("missing required dependencies before restart:\n  - " + "\n  - ".join(missing))
 
 
+def emit_command_output(stdout_text: str, stderr_text: str) -> None:
+    if stdout_text:
+        print(stdout_text, end="")
+    if stderr_text:
+        print(stderr_text, end="", file=sys.stderr)
+
+
 def run_command(command: list[str], cwd: Path) -> None:
     print_step(f"run: {' '.join(command)} (cwd={cwd})")
-    subprocess.run(command, cwd=str(cwd), check=True)
+    result = subprocess.run(command, cwd=str(cwd), check=False, capture_output=True, text=True)
+    emit_command_output(result.stdout or "", result.stderr or "")
+    if result.returncode != 0:
+        fail(
+            f"command failed with exit code {result.returncode}: {' '.join(command)} (cwd={cwd})"
+        )
 
 
 def read_server_config(config_path: Path) -> tuple[str, int]:
@@ -910,8 +924,26 @@ def build_frontend(pnpm_bin: str) -> None:
     run_command([pnpm_bin, "build"], FRONTEND_DIR)
 
 
+def ensure_embedded_frontend_assets_ready() -> None:
+    if EMBED_FRONTEND_INDEX_HTML.exists():
+        return
+
+    if EMBED_FRONTEND_DIST_DIR.exists():
+        fail(
+            f"embedded frontend assets are incomplete: `{EMBED_FRONTEND_INDEX_HTML}` is missing. "
+            f"Run `pnpm build` in `{FRONTEND_DIR}` to regenerate the embedded frontend bundle"
+        )
+
+    fail(
+        f"embedded frontend assets are missing: `{EMBED_FRONTEND_DIST_DIR}` does not exist, and "
+        f"`{EMBED_FRONTEND_INDEX_HTML}` was not found. Run `pnpm build` in `{FRONTEND_DIR}` before "
+        "building the backend with `-tags embed`"
+    )
+
+
 def build_backend(go_bin: str, binary_path: Path) -> None:
     binary_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_embedded_frontend_assets_ready()
     run_command([go_bin, "build", "-tags", "embed", "-o", str(binary_path), "./cmd/server"], BACKEND_DIR)
 
 

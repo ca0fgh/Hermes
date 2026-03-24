@@ -174,6 +174,53 @@ class EnsurePreflightReadyTest(unittest.TestCase):
         self.assertIn("`go`: missing", stderr.getvalue())
 
 
+class RunCommandTest(unittest.TestCase):
+    def test_run_command_surfaces_child_output_before_exiting(self):
+        command = ["go", "build", "./cmd/server"]
+        completed = restart.subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="compile output\n",
+            stderr="compile error\n",
+        )
+
+        with mock.patch.object(restart.subprocess, "run", return_value=completed) as run_cmd:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as exc:
+                        restart.run_command(command, Path("/tmp/backend"))
+
+        self.assertEqual(1, exc.exception.code)
+        run_cmd.assert_called_once()
+        self.assertIn("compile output", stdout.getvalue())
+        self.assertIn("compile error", stderr.getvalue())
+        self.assertIn("command failed with exit code 1", stderr.getvalue())
+        self.assertIn("go build ./cmd/server", stderr.getvalue())
+
+
+class BuildBackendTest(unittest.TestCase):
+    def test_build_backend_fails_early_when_embedded_frontend_assets_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_bin = Path(tmpdir) / ".hermes-proxy-runtime" / "hermes-proxy"
+            missing_dist_dir = Path(tmpdir) / "backend" / "internal" / "web" / "dist"
+            missing_index = missing_dist_dir / "index.html"
+
+            with mock.patch.object(restart, "EMBED_FRONTEND_DIST_DIR", missing_dist_dir):
+                with mock.patch.object(restart, "EMBED_FRONTEND_INDEX_HTML", missing_index):
+                    with mock.patch.object(restart, "run_command") as run_command:
+                        stderr = io.StringIO()
+                        with contextlib.redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit) as exc:
+                                restart.build_backend("/mock/go", runtime_bin)
+
+        self.assertEqual(1, exc.exception.code)
+        run_command.assert_not_called()
+        self.assertIn("embedded frontend assets", stderr.getvalue())
+        self.assertIn(str(missing_index), stderr.getvalue())
+
+
 class EnsureRuntimeServicesTest(unittest.TestCase):
     def test_build_local_database_guard_issue_reports_more_complete_alternative_port(self):
         with tempfile.TemporaryDirectory() as tmpdir:
