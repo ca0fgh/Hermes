@@ -45,7 +45,12 @@ func (s *GatewayService) ForwardAsResponses(
 	originalModel := responsesReq.Model
 	clientStream := responsesReq.Stream
 
-	// 2. Convert Responses → Anthropic
+	// 2. For OpenAI platform, forward directly without conversion
+	if account.Platform == PlatformOpenAI {
+		return s.forwardResponsesToOpenAI(ctx, c, account, body, originalModel, clientStream, startTime)
+	}
+
+	// 3. Convert Responses → Anthropic
 	anthropicReq, err := apicompat.ResponsesToAnthropicRequest(&responsesReq)
 	if err != nil {
 		return nil, fmt.Errorf("convert responses to anthropic: %w", err)
@@ -516,3 +521,143 @@ func mapUpstreamStatusCode(code int) int {
 	}
 	return code
 }
+
+// forwardResponsesToOpenAI forwards Responses API requests directly to OpenAI-compatible upstreams
+// without format conversion. This enables using OpenAI-compatible proxies as upstream.
+func (s *GatewayService) forwardResponsesToOpenAI(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	originalModel string,
+	clientStream bool,
+	startTime time.Time,
+) (*ForwardResult, error) {
+	// 1. Model mapping
+	mappedModel := originalModel
+	if account.Type == AccountTypeAPIKey {
+		mappedModel = account.GetMappedModel(originalModel)
+	}
+
+	// Update model in request body if mapped
+	if mappedModel != originalModel {
+		body = []byte(strings.Replace(string(body), `"`+originalModel+`"`, `"`+mappedModel+`"`, 1))
+	}
+
+	logger.L().Debug("gateway forward_responses_to_openai: model mapping applied",
+		zap.Int64("account_id", account.ID),
+		zap.String("original_model", originalModel),
+		zap.String("mapped_model", mappedModel),
+		zap.Bool("client_stream", clientStream),
+	)
+
+	// 2. Get access token
+	token, tokenType, err := s.GetAccessToken(ctx, account)
+	if err != nil {
+		return nil, fmt.Errorf("get access token: %w", err)
+	}
+
+	// 3. Get proxy URL
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+
+	// 4. Build upstream request
+	baseURL := account.GetCredential("base_url")
+	if baseURL == "" {
+		return nil, fmt.Errorf("base_url not configured for OpenAI account")
+	}
+	upstreamURL := strings.TrimSuffix(baseURL, "/") + "/responses"
+
+	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, clientStream)
+	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, "POST", upstreamURL, bytes.NewReader(body))
+	releaseUpstreamCtx()
+	if err != nil {
+		return nil, fmt.Errorf("create upstream request: %w", err)
+	}
+
+	// Set headers
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	if tokenType == "bearer" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		upstreamReq.Header.Set("Authorization", token)
+	}
+
+	// 5. Send request
+	resp, err := s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		safeErr := sanitizeUpstreamErrorMessage(err.Error())
+		setOpsUpstreamError(c, 0, safeErr, "")
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: 0,
+			Kind:               "request_error",
+			Message:            safeErr,
+		})
+		writeResponsesError(c, http.StatusBadGateway, "server_error", "Upstream request failed")
+		return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 6. Handle error response
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+
+		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
+		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
+
+		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				AccountName:        account.Name,
+				UpstreamStatusCode: resp.StatusCode,
+				UpstreamRequestID:  resp.Header.Get("x-request-id"),
+				Kind:               "failover",
+				Message:            upstreamMsg,
+			})
+			if s.rateLimitService != nil {
+				s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
+			}
+			return nil, &UpstreamFailoverError{
+				StatusCode:   resp.StatusCode,
+				ResponseBody: respBody,
+			}
+		}
+
+		writeResponsesError(c, mapUpstreamStatusCode(resp.StatusCode), "server_error", upstreamMsg)
+		return nil, fmt.Errorf("upstream error: %d %s", resp.StatusCode, upstreamMsg)
+	}
+
+	// 7. Forward response directly to client
+	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, nil)
+	c.Status(resp.StatusCode)
+
+	// Copy response body
+	_, err = io.Copy(c.Writer, resp.Body)
+	if err != nil {
+		logger.L().Warn("forward_responses_to_openai: copy response failed",
+			zap.Error(err),
+			zap.Int64("account_id", account.ID),
+		)
+		return nil, err
+	}
+
+	// 8. Return result (usage tracking will be handled by caller if needed)
+	return &ForwardResult{
+		Model:         mappedModel,
+		UpstreamModel: mappedModel,
+		Stream:        clientStream,
+		Duration:      time.Since(startTime),
+		Usage:         ClaudeUsage{}, // OpenAI responses include usage in body
+	}, nil
+}
+
